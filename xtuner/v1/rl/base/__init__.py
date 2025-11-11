@@ -1,6 +1,7 @@
 from .controller import TrainingController
 from .loss import BaseRLLossConfig, RLLossContextInputItem
 from .worker import TrainingWorker, WorkerConfig
+from .rollout_is import RolloutImportanceSampling
 
 
 __all__ = [
@@ -9,4 +10,5 @@ __all__ = [
     "WorkerConfig",
     "BaseRLLossConfig",
     "RLLossContextInputItem",
+    "RolloutImportanceSampling"
 ]
