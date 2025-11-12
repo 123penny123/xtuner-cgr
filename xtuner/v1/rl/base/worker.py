@@ -8,6 +8,7 @@ import requests
 import torch
 import torch.distributed as dist
 import tqdm
+import json
 from pydantic import BaseModel, ConfigDict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -338,8 +339,6 @@ class TrainingWorker(SingleAcceleratorWorker):
                 loss_ctx_input = loss_ctx_input.sp_split(self.sp_mesh)
             seq_ctx_list.append(seq_ctx)
             loss_ctx_input_list.append(loss_ctx_input)
-            if "rollout_logprobs" in data and data["rollout_logprobs"] is not None:
-                rollout_logprobs_list.append(data["rollout_logprobs"].to(DEVICE))
 
         del data_batches
 
