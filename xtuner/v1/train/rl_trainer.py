@@ -725,7 +725,8 @@ class RLTrainer:
             latest_exp.history.append(new_exp_history)
         else:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            exp_dir = work_dir / timestamp
+            # exp_dir = work_dir / timestamp
+            exp_dir = work_dir
             git_dir = Path(f"{exp_dir}/git-info-begin-{0}")
 
             if not git_dir.exists():
