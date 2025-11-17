@@ -36,7 +36,6 @@ def run_lmdeploy_server_wrapper(lmdeploy_config_namespace: Namespace):
     serve(**lmdeploy_serve_kwargs)
 
 
-@ray.remote
 class LMDeployWorker(RolloutWorker):
     """A Ray actor that runs a text generation server using LMDeploy."""
 
@@ -73,6 +72,7 @@ class LMDeployWorker(RolloutWorker):
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_path, trust_remote_code=True)
         self.api_keys = self.config.api_key
         self.model_name = self.config.model_name
+        self.enable_return_routed_experts = self.config.enable_return_routed_experts
 
     async def _create_request(
         self,
@@ -123,6 +123,16 @@ class LMDeployWorker(RolloutWorker):
                 payload["input_ids"] = prompt_token_ids
         else:
             payload["messages"] = prompt
+
+        if "num_return_tokens" in extra_params:
+            max_return_tokens = sample_params["max_tokens"] - extra_params["num_return_tokens"]
+            sample_params["max_tokens"] = max_return_tokens
+            self.logger.info(
+                f"Set max_tokens to {max_return_tokens} based on num_return_tokens {extra_params['num_return_tokens']}"
+            )
+
+        if self.enable_return_routed_experts:
+            extra_params["return_routed_experts"] = True
 
         lmdeploy_sample_params = self._transform_sample_params(sample_params, extra_params)
         payload.update(lmdeploy_sample_params)
@@ -223,6 +233,11 @@ class LMDeployWorker(RolloutWorker):
         tp_size = self.config.tensor_parallel_size
         dp_size = ep_size = self.config.expert_parallel_size
         distributed_executor_backend = lmdeploy_config_kwargs.get("distributed_executor_backend", "ray")
+
+        extra_engine_config = {}
+        if backend == "pytorch" and self.config.enable_return_routed_experts:
+            extra_engine_config["enable_return_routed_experts"] = True
+
         backend_config = (
             PytorchEngineConfig(
                 tp=tp_size,
@@ -235,6 +250,7 @@ class LMDeployWorker(RolloutWorker):
                 device_type=accelerator_to_device_type[self.accelerator],
                 logprobs_mode="raw_logprobs",
                 session_len=self.config.context_length,
+                **extra_engine_config,
             )
             if backend == "pytorch"
             else TurbomindEngineConfig(

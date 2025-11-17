@@ -32,6 +32,7 @@ class SGLangWorker(RolloutWorker):
         self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_path, trust_remote_code=True)
         self.api_keys = self.config.api_key
         self.model_name = self.config.model_name
+        self.enable_return_routed_experts = self.config.enable_return_routed_experts
 
     async def _create_request(
         self,
@@ -51,6 +52,9 @@ class SGLangWorker(RolloutWorker):
         payload = {"model": self.model_name}
         sglang_sample_params = self._transform_sample_params(sample_params)
         sglang_extra_params = self._transform_extra_params(extra_params)
+        if self.enable_return_routed_experts:
+            sglang_extra_params["return_routed_experts"] = True
+
         payload.update(sglang_extra_params)
 
         if "return_token_ids" in extra_params and extra_params["return_token_ids"]:
@@ -65,16 +69,28 @@ class SGLangWorker(RolloutWorker):
                 text_prompt = self.tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
                 prompt_token_ids = self.tokenizer(text_prompt, add_special_tokens=False)["input_ids"]
                 payload["input_ids"] = prompt_token_ids
+            if "num_return_tokens" in extra_params:
+                max_return_tokens = sglang_sample_params["max_tokens"] - extra_params["num_return_tokens"]
+                sglang_sample_params["max_tokens"] = max_return_tokens
+                self.logger.info(
+                    f"Set max_tokens to {max_return_tokens} based on num_return_tokens {extra_params['num_return_tokens']}"
+                )
             payload["sampling_params"] = sglang_sample_params
         else:
             payload["messages"] = prompt
             payload.update(sglang_sample_params)
             # note: chat completions 接口需要传入 max_tokens 和 min_tokens 参数
-            payload["max_tokens"] = sglang_sample_params["max_new_tokens"]
+            if "num_return_tokens" in extra_params:
+                max_return_tokens = sglang_sample_params["max_new_tokens"] - extra_params["num_return_tokens"]
+                payload["max_tokens"] = max_return_tokens
+                self.logger.info(
+                    f"Set max_tokens to {max_return_tokens} based on num_return_tokens {extra_params['num_return_tokens']}"
+                )
+            else:
+                payload["max_tokens"] = sglang_sample_params["max_new_tokens"]
             payload["min_tokens"] = sglang_sample_params["min_new_tokens"]
             payload.pop("max_new_tokens", None)
             payload.pop("min_new_tokens", None)
-
         return await self._safe_post_request(url, headers, payload)
 
     def _make_request(self, endpoint: str, payload=None):
@@ -147,23 +163,38 @@ class SGLangWorker(RolloutWorker):
         )  # for intern-s1 series models, have to set the grammar_backend to "none"
         log_level = sglang_config_kwargs.get("log_level", "critical")
         log_level_http = sglang_config_kwargs.get("log_level_http", "critical")
+        enable_deterministic_inference = sglang_config_kwargs.get("enable_deterministic_inference", False)
 
         sglang_server_args = ServerArgs(model_path=self.config.model_path, trust_remote_code=True)
+        num_gpus_per_engine = (
+            self.config.expert_parallel_size
+            if self.config.expert_parallel_size > 1
+            else self.config.tensor_parallel_size
+        )
         sglang_server_args.host = self.host
         sglang_server_args.port = self.server_port
         sglang_server_args.nccl_port = self.nccl_port
         sglang_server_args.dist_init_addr = self.dist_init_addr
-        sglang_server_args.base_gpu_id = self.rank % self.config.gpus_per_node
+        base_gpu_id_interval = min(num_gpus_per_engine, self.config.gpus_per_node)
+        sglang_server_args.base_gpu_id = (self.rank * base_gpu_id_interval) % self.config.gpus_per_node
         sglang_server_args.gpu_id_step = 1
-        sglang_server_args.nnodes = max(1, self.config.tensor_parallel_size // self.config.gpus_per_node)
+        sglang_server_args.nnodes = max(1, num_gpus_per_engine // self.config.gpus_per_node)
         sglang_server_args.skip_server_warmup = True
-        sglang_server_args.tp_size = self.config.tensor_parallel_size
+
         sglang_server_args.mem_fraction_static = self.config.gpu_memory_utilization
         # note: 非共卡模式下无需设置,共卡模式下需要offload必须设置，否则显存释放不了
         sglang_server_args.enable_memory_saver = True
+
+        if self.enable_return_routed_experts:
+            sglang_server_args.enable_return_routed_experts = True
+
         sglang_server_args.max_running_requests = self.config.rollout_max_batch_size_per_instance
         sglang_server_args.log_level = log_level
         sglang_server_args.log_level_http = log_level_http
+        sglang_server_args.enable_deterministic_inference = enable_deterministic_inference
+        sglang_server_args.tp_size = num_gpus_per_engine
+        sglang_server_args.ep_size = num_gpus_per_engine
+
         if grammar_backend is not None:
             sglang_server_args.grammar_backend = grammar_backend
 
@@ -174,6 +205,7 @@ class SGLangWorker(RolloutWorker):
             sglang_server_args.node_rank = self.rank // self.config.gpus_per_node
         else:
             sglang_server_args.node_rank = 0
+
         return sglang_server_args
 
     def _transform_sample_params(self, sample_params: Dict):
