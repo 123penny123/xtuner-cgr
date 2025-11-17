@@ -239,7 +239,10 @@ class ReplayBufferConfig(BaseModel):
         Parameter(help="Weights for different states in the replay buffer."),
     ] = {}
     worker_log_dir: Annotated[Path, Parameter(help="Directory to save worker logs.")] = Path.cwd() / "work_dir"
-
+    use_priority_queue: Annotated[
+        bool,
+        Parameter(help="Whether to use priority queue (sorted by version desc) or FIFO queue for replay buffer."),
+    ] = False
 
 class Sampler:
     """Sampler for drawing prompts from datasets or the replay buffer."""
@@ -310,10 +313,24 @@ class Sampler:
 class ReplayBufferStorage:
     """Handles the storage of experiences for the replay buffer."""
 
-    def __init__(self, worker_log_dir):
-        """Initializes the data structures for storing replay data."""
-        self._interrupted_actions: deque[int] = deque()  # FIFO queue of paused action_id,
-        self._completed_actions: deque[int] = deque()  # FIFO queue of returned action_id,
+    def __init__(self, worker_log_dir, use_priority_queue: bool = True):
+        """Initializes the data structures for storing replay data.
+        
+        Args:
+            worker_log_dir: Directory for worker logs
+            use_priority_queue: If True, use priority queue (sorted by version desc).
+                              If False, use simple FIFO queue.
+        """
+        self.use_priority_queue = use_priority_queue
+        
+        if use_priority_queue:
+            # Use bucketing strategy: maintain separate queues for each version
+            self._interrupted_actions_by_version: Dict[int, deque[int]] = defaultdict(deque)
+            self._completed_actions_by_version: Dict[int, deque[int]] = defaultdict(deque)
+        else:
+            # Use simple FIFO queues
+            self._interrupted_actions: deque[int] = deque()
+            self._completed_actions: deque[int] = deque()
         self._expired_actions: deque[int] = deque()  # FIFO queue of paused action_id over version
 
         self._actions: Dict[int, ReplayMeta] = {}  # action_id: ReplayMeta
@@ -326,6 +343,104 @@ class ReplayBufferStorage:
         )  # action_id: [observation_id, observation_id, ...]
         self.logger = get_logger(log_dir=worker_log_dir, tag="ReplayBuffer")
         self._multimodal_train_infos: Dict[int, Dict[str, Any]] = {}
+
+    def _add_action_by_version(self, actions_by_version: Dict[int, deque[int]], action_id: int):
+        """Add action_id to the appropriate version bucket. O(1) operation.
+        
+        Args:
+            actions_by_version: Dictionary mapping version to deque of action_ids
+            action_id: The action_id to add
+        """
+        version = self._actions[action_id].version
+        actions_by_version[version].append(action_id)
+
+    def _pop_action_by_max_version(self, actions_by_version: Dict[int, deque[int]], max_version: int) -> Optional[int]:
+        """Pop action_id with the highest version. O(max_version) worst case, but typically O(1).
+        
+        Args:
+            actions_by_version: Dictionary mapping version to deque of action_ids
+            max_version: The maximum possible version value
+            
+        Returns:
+            action_id with highest version, or None if no actions available
+        """
+        # Start from max version and find the first non-empty queue
+        for version in range(max_version, -1, -1):
+            if version in actions_by_version and actions_by_version[version]:
+                return actions_by_version[version].popleft()
+        return None
+    
+    def _count_actions_by_version(self, actions_by_version: Dict[int, deque[int]]) -> int:
+        """Count total number of actions across all versions. O(V) where V is number of versions.
+        
+        Args:
+            actions_by_version: Dictionary mapping version to deque of action_ids
+            
+        Returns:
+            Total number of actions
+        """
+        return sum(len(queue) for queue in actions_by_version.values())
+    
+    def _add_action(self, queue_type: str, action_id: int):
+        """Unified interface to add action to interrupted or completed queue.
+        
+        Args:
+            queue_type: 'interrupted' or 'completed'
+            action_id: The action_id to add
+        """
+        if self.use_priority_queue:
+            if queue_type == 'interrupted':
+                self._add_action_by_version(self._interrupted_actions_by_version, action_id)
+            elif queue_type == 'completed':
+                self._add_action_by_version(self._completed_actions_by_version, action_id)
+        else:
+            if queue_type == 'interrupted':
+                self._interrupted_actions.append(action_id)
+            elif queue_type == 'completed':
+                self._completed_actions.append(action_id)
+    
+    def _pop_action(self, queue_type: str, max_version: int) -> Optional[int]:
+        """Unified interface to pop action from interrupted or completed queue.
+        
+        Args:
+            queue_type: 'interrupted' or 'completed'
+            max_version: Maximum version (only used for priority queue)
+            
+        Returns:
+            action_id or None if queue is empty
+        """
+        if self.use_priority_queue:
+            if queue_type == 'interrupted':
+                return self._pop_action_by_max_version(self._interrupted_actions_by_version, max_version)
+            elif queue_type == 'completed':
+                return self._pop_action_by_max_version(self._completed_actions_by_version, max_version)
+        else:
+            if queue_type == 'interrupted' and self._interrupted_actions:
+                return self._interrupted_actions.popleft()
+            elif queue_type == 'completed' and self._completed_actions:
+                return self._completed_actions.popleft()
+        return None
+    
+    def _count_actions(self, queue_type: str) -> int:
+        """Unified interface to count actions in interrupted or completed queue.
+        
+        Args:
+            queue_type: 'interrupted' or 'completed'
+            
+        Returns:
+            Number of actions in the queue
+        """
+        if self.use_priority_queue:
+            if queue_type == 'interrupted':
+                return self._count_actions_by_version(self._interrupted_actions_by_version)
+            elif queue_type == 'completed':
+                return self._count_actions_by_version(self._completed_actions_by_version)
+        else:
+            if queue_type == 'interrupted':
+                return len(self._interrupted_actions)
+            elif queue_type == 'completed':
+                return len(self._completed_actions)
+        return 0
 
     def add(self, grouped_dataitem: List[RLDataFlowItem], partial_rollout_step: int = 0):
         """Adds a group of data items to the storage.
@@ -359,9 +474,9 @@ class ReplayBufferStorage:
 
         # 2. 根据rollout状态加到finished, abort, abort_over_version队列中；Partial rollout is handled based on whether finish_reason is "abort".
         if replay_meta.state == ReplayState.INTERRUPTED and replay_meta.version < partial_rollout_step:
-            self._interrupted_actions.append(action_id)
+            self._add_action('interrupted', action_id)
             self.logger.debug(
-                f"Add aborted sample with root_id: {root_id}, action_id: {action_id} to _interrupted_actions."
+                f"Add aborted sample with root_id: {root_id}, action_id: {action_id}, version: {replay_meta.version} to _interrupted_actions."
             )
         elif replay_meta.state == ReplayState.INTERRUPTED and replay_meta.version >= partial_rollout_step:
             self._expired_actions.append(action_id)
@@ -370,8 +485,8 @@ class ReplayBufferStorage:
                 f"Action_id: {action_id} has exceeded partial_rollout_step {partial_rollout_step}. Add this sample with root_id: {root_id} to _expired_actions list."
             )
         elif replay_meta.state == ReplayState.COMPLETED:
-            self._completed_actions.append(action_id)
-            self.logger.debug(f"Add sample with root_id: {root_id}, action_id: {action_id} to finished_actions.")
+            self._add_action('completed', action_id)
+            self.logger.debug(f"Add sample with root_id: {root_id}, action_id: {action_id}, version: {replay_meta.version} to finished_actions.")
         elif replay_meta.state == ReplayState.FAILED:
             assert False, "Currently, failed samples are not supported in the replay buffer."
 
@@ -383,17 +498,30 @@ class ReplayBufferStorage:
             self._states[str(replay_meta.state)].append(observation_id)
 
     def clear(self):
-        attrs_to_clear = [
-            "_interrupted_actions",
-            "_completed_actions",
-            "_expired_actions",
-            "_actions",
-            "_root2actions",
-            "_observations",
-            "_observations2states",
-            "_states",
-            "_action2observations",
-        ]
+        if self.use_priority_queue:
+            attrs_to_clear = [
+                "_interrupted_actions_by_version",
+                "_completed_actions_by_version",
+                "_expired_actions",
+                "_actions",
+                "_root2actions",
+                "_observations",
+                "_observations2states",
+                "_states",
+                "_action2observations",
+            ]
+        else:
+            attrs_to_clear = [
+                "_interrupted_actions",
+                "_completed_actions",
+                "_expired_actions",
+                "_actions",
+                "_root2actions",
+                "_observations",
+                "_observations2states",
+                "_states",
+                "_action2observations",
+            ]
         for attr in attrs_to_clear:
             getattr(self, attr).clear()
 
@@ -416,16 +544,22 @@ class ReplayBufferStorage:
         """
         samples = []
         multimodal_train_infos = []
-        if len(self._completed_actions) < global_batch_size:
+        total_completed = self._count_actions('completed')
+        
+        if total_completed < global_batch_size:
             self.logger.error("Not enough finished samples in replay buffer")
             return [], []
         else:
             self.logger.info(
-                f"Retrieving global_batch_size {global_batch_size} from replay buffer, len of self.returned: {len(self._completed_actions)}"
+                f"Retrieving global_batch_size {global_batch_size} from replay buffer, total completed: {total_completed}"
             )
-            target_finished_list = self._completed_actions[:global_batch_size]
-            remain_finished_list = self._completed_actions[global_batch_size:]
-            for action_id in target_finished_list:
+            # Pop actions (from highest version first if using priority queue, or FIFO if not)
+            for _ in range(global_batch_size):
+                action_id = self._pop_action('completed', partial_rollout_step)
+                if action_id is None:
+                    self.logger.error("Unexpectedly ran out of completed actions")
+                    break
+
                 replay_meta = self._actions[action_id]
                 group_samples = mapping_replaymeta_to_dataitem(self._actions[action_id])
                 multimodal_train_info = None
@@ -437,16 +571,16 @@ class ReplayBufferStorage:
                 samples.append(group_samples)
                 if multimodal_train_info is not None:
                     multimodal_train_infos.append(multimodal_train_info)
-            self._completed_actions = remain_finished_list
+
             return samples, multimodal_train_infos
 
     def get_completed_samples(self):
         """Returns the number of finished sample groups."""
-        return len(self._completed_actions)
+        return self._count_actions('completed')
 
     def get_interrupted_samples(self):
         """Returns the number of unfinished sample groups."""
-        return len(self._interrupted_actions)
+        return self._count_actions('interrupted')
 
     def get_expired_samples(self):
         return len(self._expired_actions)
@@ -456,12 +590,13 @@ class ReplayBufferStorage:
 
     def status(self):
         return {
-            "rollout_completed_count": len(self._completed_actions),
-            "rollout_interrupted_count": len(self._interrupted_actions),
+            "rollout_completed_count": self._count_actions('completed'),
+            "rollout_interrupted_count": self._count_actions('interrupted'),
             "rollout_expired_count": len(self._expired_actions),
             "prompt_count": len(self._root2actions),
             "action_count": len(self._actions),
             "observation_count": len(self._observations),
+            "use_priority_queue": self.use_priority_queue,
         }
 
     def dump(self, file_path: str):
@@ -513,17 +648,21 @@ class ReplayBufferStorage:
             action_id = replay_meta.action_id
             state = replay_meta.state
             self.logger.info(f"state of replay_meta while resuming: {replay_meta}")
-            if state == ReplayState.ABORTED:
-                self._interrupted_actions.append(action_id)
-            elif state == ReplayState.ABORTED_OVER_VERSION:
-                self._expired_actions.append(action_id)
-            elif state == ReplayState.FINISHED:
-                self._completed_actions.append(action_id)
+            # First add to _actions so that _add_action can access version info
             if root_id not in self._root2actions:
                 self._root2actions[root_id] = [action_id]
             else:
                 self._root2actions[root_id].append(action_id)
             self._actions[action_id] = replay_meta
+
+            # Then add to appropriate queues
+            if state == ReplayState.ABORTED:
+                self._add_action('interrupted', action_id)
+            elif state == ReplayState.ABORTED_OVER_VERSION:
+                self._expired_actions.append(action_id)
+            elif state == ReplayState.FINISHED:
+                self._add_action('completed', action_id)
+
             for observation_id in replay_meta.observation_ids:
                 self._action2observations[action_id].append(observation_id)
                 self._observations[observation_id] = replay_meta
@@ -551,7 +690,7 @@ class ReplayBuffer:
             config (ReplayBufferConfig): The configuration object.
         """
         self.config = config
-        self.storage = ReplayBufferStorage(config.worker_log_dir)
+        self.storage = ReplayBufferStorage(config.worker_log_dir, config.use_priority_queue)
         self.tokenizer = config.tokenizer
         if isinstance(self.tokenizer, str):
             self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer, trust_remote_code=True)
@@ -603,22 +742,57 @@ class ReplayBuffer:
 
     def refresh_completed_states_on_step(self, sample_from_expired_states):
         if sample_from_expired_states:
-            for action_id in self.storage._completed_actions:
-                replay_meta = self.storage._actions[action_id]
-                replay_meta.state = ReplayState.INTERRUPTED
-                replay_meta.version += 1
-                self.storage._interrupted_actions.append(action_id)
-            self.storage._completed_actions = []
+            # Move all completed actions to interrupted
+            if self.storage.use_priority_queue:
+                for version, action_queue in self.storage._completed_actions_by_version.items():
+                    while action_queue:
+                        action_id = action_queue.popleft()
+                        replay_meta = self.storage._actions[action_id]
+                        replay_meta.state = ReplayState.INTERRUPTED
+                        replay_meta.version += 1
+                        self.storage._add_action('interrupted', action_id)
+                self.storage._completed_actions_by_version.clear()
+            else:
+                while self.storage._completed_actions:
+                    action_id = self.storage._completed_actions.popleft()
+                    replay_meta = self.storage._actions[action_id]
+                    replay_meta.state = ReplayState.INTERRUPTED
+                    replay_meta.version += 1
+                    self.storage._add_action('interrupted', action_id)
         else:
-            update_completed_actions = []
-            for action_id in self.storage._completed_actions:
-                replay_meta = self.storage._actions[action_id]
-                if replay_meta.version >= self.partial_rollout_step:
-                    self.storage._expired_actions.append(action_id)
-                    replay_meta.state = ReplayState.EXPIRED
-                else:
-                    update_completed_actions.append(action_id)
-            self.storage._completed_actions = update_completed_actions
+            # Move completed actions with version >= partial_rollout_step to expired
+            if self.storage.use_priority_queue:
+                versions_to_remove = []
+                for version, action_queue in list(self.storage._completed_actions_by_version.items()):
+                    actions_to_keep = deque()
+                    while action_queue:
+                        action_id = action_queue.popleft()
+                        replay_meta = self.storage._actions[action_id]
+                        if replay_meta.version >= self.partial_rollout_step:
+                            self.storage._expired_actions.append(action_id)
+                            replay_meta.state = ReplayState.EXPIRED
+                        else:
+                            actions_to_keep.append(action_id)
+                    
+                    if actions_to_keep:
+                        self.storage._completed_actions_by_version[version] = actions_to_keep
+                    else:
+                        versions_to_remove.append(version)
+                
+                # Clean up empty version buckets
+                for version in versions_to_remove:
+                    del self.storage._completed_actions_by_version[version]
+            else:
+                actions_to_keep = deque()
+                while self.storage._completed_actions:
+                    action_id = self.storage._completed_actions.popleft()
+                    replay_meta = self.storage._actions[action_id]
+                    if replay_meta.version >= self.partial_rollout_step:
+                        self.storage._expired_actions.append(action_id)
+                        replay_meta.state = ReplayState.EXPIRED
+                    else:
+                        actions_to_keep.append(action_id)
+                self.storage._completed_actions = actions_to_keep
 
     def _sample_from_expired_storage(self) -> List[RLDataFlowItem]:
         # note: 预先假定从expired storage中采样一定是同步模式，且并发度不会大于global_batch_size且不会多采样
@@ -641,7 +815,11 @@ class ReplayBuffer:
 
     def _sample_from_interrupted_storage(self) -> List[RLDataFlowItem]:
         assert self.storage.get_interrupted_samples() > 0
-        action_id = self.storage._interrupted_actions.popleft()
+        # Pop action (with highest version if using priority queue, or FIFO if not)
+        action_id = self.storage._pop_action('interrupted', self.partial_rollout_step)
+        if action_id is None:
+            raise RuntimeError("Unexpectedly ran out of interrupted actions")
+        
         replay_meta = self.storage._actions[action_id]
         group_samples = mapping_replaymeta_to_dataitem(replay_meta)
 
