@@ -244,7 +244,6 @@ class ReplayBufferConfig(BaseModel):
         Parameter(help="Whether to use priority queue (sorted by version desc) or FIFO queue for replay buffer."),
     ] = False
 
-
 class Sampler:
     """Sampler for drawing prompts from datasets or the replay buffer."""
 
@@ -326,14 +325,12 @@ class ReplayBufferStorage:
         
         if use_priority_queue:
             # Use bucketing strategy: maintain separate queues for each version
-            # This gives O(1) insert and O(V) retrieve operations
             self._interrupted_actions_by_version: Dict[int, deque[int]] = defaultdict(deque)
             self._completed_actions_by_version: Dict[int, deque[int]] = defaultdict(deque)
         else:
-            # Use simple FIFO queues - O(1) for both insert and retrieve
+            # Use simple FIFO queues
             self._interrupted_actions: deque[int] = deque()
             self._completed_actions: deque[int] = deque()
-        
         self._expired_actions: deque[int] = deque()  # FIFO queue of paused action_id over version
 
         self._actions: Dict[int, ReplayMeta] = {}  # action_id: ReplayMeta
@@ -490,7 +487,7 @@ class ReplayBufferStorage:
         elif replay_meta.state == ReplayState.COMPLETED:
             self._add_action('completed', action_id)
             self.logger.debug(f"Add sample with root_id: {root_id}, action_id: {action_id}, version: {replay_meta.version} to finished_actions.")
-        elif replay_meta.state == ReplayState.FAILED or replay_meta.state == ReplayState.FAILED:
+        elif replay_meta.state == ReplayState.FAILED:
             assert False, "Currently, failed samples are not supported in the replay buffer."
 
         # 3. observation
@@ -562,7 +559,6 @@ class ReplayBufferStorage:
                 if action_id is None:
                     self.logger.error("Unexpectedly ran out of completed actions")
                     break
-                    
                 replay_meta = self._actions[action_id]
                 group_samples = mapping_replaymeta_to_dataitem(self._actions[action_id])
                 multimodal_train_info = None
@@ -574,7 +570,6 @@ class ReplayBufferStorage:
                 samples.append(group_samples)
                 if multimodal_train_info is not None:
                     multimodal_train_infos.append(multimodal_train_info)
-            
             return samples, multimodal_train_infos
 
     def get_completed_samples(self):
