@@ -1400,10 +1400,19 @@ class BaseRLTrainer:
             all_scalars.update({f"{k}": v for k, v in rank0_mismatch_metrics.items()})
             all_scalars.update({"entropy/rollout": rank0_rollout_entropy})
             all_scalars.update({"entropy/train": rank0_log_item["train_entropy"]})
-            if "opd_reverse_kl" in rank0_log_item:
-                all_scalars["opd_reverse_kl"] = rank0_log_item["opd_reverse_kl"]
-            if "opd_abs_logprob_loss" in rank0_log_item:
-                all_scalars["opd_abs_logprob_loss"] = rank0_log_item["opd_abs_logprob_loss"]
+            opd_scalar_names = (
+                "reverse_kl",
+                "abs_logprob_loss",
+                "reverse_kl_variance",
+                "reverse_kl_p1",
+                "reverse_kl_p99",
+                "reverse_kl_p999",
+                "reverse_kl_max_abs",
+            )
+            for scalar_name in opd_scalar_names:
+                worker_log_name = f"opd_{scalar_name}"
+                if worker_log_name in rank0_log_item:
+                    all_scalars[f"opd/{scalar_name}"] = rank0_log_item[worker_log_name]
             for worker_idx, log_item in enumerate(train_info["workers_log_item"]):
                 if not self._display_all_workers_log and worker_idx > 0:
                     break

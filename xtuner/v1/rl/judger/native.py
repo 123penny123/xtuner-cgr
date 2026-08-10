@@ -265,6 +265,10 @@ class JudgerPool(Judger):
         self._lock = asyncio.Lock()
         self._worker_loads = dict.fromkeys(range(len(replicas)), 0)
 
+    def preprocess(self, rollout_state: RolloutState) -> JudgerPayload:
+        # 所有 replica 是同一种 judger，payload schema 相同
+        return self.replicas[0].preprocess(rollout_state)
+
     async def _pick_replica(self) -> tuple[int, Judger]:
         async with self._lock:
             replica_idx = self._rr_index % len(self.replicas)

@@ -45,7 +45,11 @@ from xtuner.v1.model.compose.base import BaseComposeConfig, BaseComposeModel
 from xtuner.v1.model.utils.misc import ModelForwardExtraLogInfo
 from xtuner.v1.profiler import profiling_memory, profiling_time
 from xtuner.v1.rl.loss import BaseRLLossConfig, BaseRLLossContext, finalize_train_policy_metrics, kl_penalty
-from xtuner.v1.rl.on_policy_distillation import OPDConfig, apply_opd_kl_to_advantages
+from xtuner.v1.rl.on_policy_distillation import (
+    OPDConfig,
+    apply_opd_kl_to_advantages,
+    compute_reverse_kl_distribution_metrics,
+)
 from xtuner.v1.rl.utils import SingleAcceleratorWorker
 from xtuner.v1.rl.weight_update import UpdateWeighter
 from xtuner.v1.train.trainer import LoadCheckpointConfig
@@ -201,6 +205,11 @@ class WorkerLogItem(TypedDict):
     train_entropy: float
     opd_reverse_kl: NotRequired[float]
     opd_abs_logprob_loss: NotRequired[float]
+    opd_reverse_kl_variance: NotRequired[float]
+    opd_reverse_kl_p1: NotRequired[float]
+    opd_reverse_kl_p99: NotRequired[float]
+    opd_reverse_kl_p999: NotRequired[float]
+    opd_reverse_kl_max_abs: NotRequired[float]
     rollout_entropy: NotRequired[float]
     mismatch_metrics: NotRequired[dict[str, float]]
     rollout_is_metrics: NotRequired[dict[str, float]]
@@ -631,22 +640,16 @@ class TrainingWorker(SingleAcceleratorWorker):
 
         # compute old logprobs
         old_logprobs_list = self.compute_actor_logprobs(seq_ctx_list, shifted_labels_list)
-        rank_opd_reverse_kl_sum: torch.Tensor | None = None
-        rank_opd_abs_logprob_loss_sum: torch.Tensor | None = None
+        rank_reverse_kl_values: list[torch.Tensor] = []
         for old_logprobs, loss_ctx in zip(old_logprobs_list, loss_ctx_list):
             loss_ctx.loss_kwargs.old_logprobs = old_logprobs
             if self.config.opd_config is not None:
-                reverse_kl_sum, abs_logprob_loss_sum = apply_opd_kl_to_advantages(
-                    loss_ctx, config=self.config.opd_config
+                teacher_logprobs = cast(torch.Tensor, loss_ctx.loss_kwargs.teacher_logprobs)
+                response_mask = loss_ctx.loss_kwargs.shifted_labels != loss_ctx.loss_cfg.ignore_idx
+                rank_reverse_kl_values.append(
+                    (old_logprobs - teacher_logprobs)[response_mask].detach()
                 )
-                rank_opd_reverse_kl_sum = (
-                    reverse_kl_sum if rank_opd_reverse_kl_sum is None else rank_opd_reverse_kl_sum + reverse_kl_sum
-                )
-                rank_opd_abs_logprob_loss_sum = (
-                    abs_logprob_loss_sum
-                    if rank_opd_abs_logprob_loss_sum is None
-                    else rank_opd_abs_logprob_loss_sum + abs_logprob_loss_sum
-                )
+                apply_opd_kl_to_advantages(loss_ctx, config=self.config.opd_config)
 
         worker_log_item: WorkerLogItem = {"train_entropy": 0.0, "train_metrics": [], "sft_train_metrics": {}}
         logger_msg = f"Rollout {rollout_idx}: "
@@ -671,27 +674,23 @@ class TrainingWorker(SingleAcceleratorWorker):
             worker_log_item["rollout_entropy"] = avg_rollout_entropy.item()
             logger_msg += f", avg rollout entropy: {avg_rollout_entropy:.4f}"
 
-        if rank_opd_reverse_kl_sum is not None:
-            global_opd_reverse_kl_sum = rank_opd_reverse_kl_sum
-            dist.all_reduce(global_opd_reverse_kl_sum, op=dist.ReduceOp.SUM)
-            avg_opd_reverse_kl = (
-                global_opd_reverse_kl_sum / global_grad_tokens
-                if global_grad_tokens > 0
-                else global_opd_reverse_kl_sum.new_zeros(())
+        if rank_reverse_kl_values:
+            opd_metrics = compute_reverse_kl_distribution_metrics(torch.cat(rank_reverse_kl_values))
+            worker_log_item["opd_reverse_kl"] = opd_metrics["reverse_kl"].item()
+            worker_log_item["opd_abs_logprob_loss"] = opd_metrics["abs_logprob_loss"].item()
+            worker_log_item["opd_reverse_kl_variance"] = opd_metrics["reverse_kl_variance"].item()
+            worker_log_item["opd_reverse_kl_p1"] = opd_metrics["reverse_kl_p1"].item()
+            worker_log_item["opd_reverse_kl_p99"] = opd_metrics["reverse_kl_p99"].item()
+            worker_log_item["opd_reverse_kl_p999"] = opd_metrics["reverse_kl_p999"].item()
+            worker_log_item["opd_reverse_kl_max_abs"] = opd_metrics["reverse_kl_max_abs"].item()
+            logger_msg += (
+                f", OPD reverse KL: {opd_metrics['reverse_kl']:.4f}"
+                f", OPD abs logprob loss: {opd_metrics['abs_logprob_loss']:.4f}"
+                f", OPD reverse KL variance: {opd_metrics['reverse_kl_variance']:.4f}"
+                f", p1/p99/p99.9: {opd_metrics['reverse_kl_p1']:.4f}/"
+                f"{opd_metrics['reverse_kl_p99']:.4f}/{opd_metrics['reverse_kl_p999']:.4f}"
+                f", max abs: {opd_metrics['reverse_kl_max_abs']:.4f}"
             )
-            worker_log_item["opd_reverse_kl"] = avg_opd_reverse_kl.item()
-            logger_msg += f", OPD reverse KL: {avg_opd_reverse_kl:.4f}"
-
-        if rank_opd_abs_logprob_loss_sum is not None:
-            global_opd_abs_logprob_loss_sum = rank_opd_abs_logprob_loss_sum
-            dist.all_reduce(global_opd_abs_logprob_loss_sum, op=dist.ReduceOp.SUM)
-            avg_opd_abs_logprob_loss = (
-                global_opd_abs_logprob_loss_sum / global_grad_tokens
-                if global_grad_tokens > 0
-                else global_opd_abs_logprob_loss_sum.new_zeros(())
-            )
-            worker_log_item["opd_abs_logprob_loss"] = avg_opd_abs_logprob_loss.item()
-            logger_msg += f", OPD abs logprob loss: {avg_opd_abs_logprob_loss:.4f}"
 
         # compute rollout importance sampling metrics
         all_rollout_is_metrics = []

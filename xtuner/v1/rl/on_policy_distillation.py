@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 
 import httpx
 import torch
+import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from xtuner.v1.data_proto.rl_data import RolloutState, SampleParams, Status
@@ -50,6 +51,7 @@ class OPDConfig(BaseModel):
     mode: Literal["pg-opd"] = "pg-opd"
     task_adv_weight: float = Field(default=0.0, ge=0.0)
     opd_adv_weight: float = Field(default=1.0, ge=0.0)
+    reverse_kl_clamp: tuple[float, float] | None = None
     teachers: list[OPDTeacherConfig] = Field(min_length=1)
     data_source_teacher_map: dict[str, str] = Field(min_length=1)
 
@@ -61,6 +63,12 @@ class OPDConfig(BaseModel):
         unknown_teachers = set(self.data_source_teacher_map.values()) - set(teacher_names)
         if unknown_teachers:
             raise ValueError(f"data_source_teacher_map references unknown teachers: {sorted(unknown_teachers)}")
+        if self.reverse_kl_clamp is not None:
+            lower, upper = self.reverse_kl_clamp
+            if not math.isfinite(lower) or not math.isfinite(upper):
+                raise ValueError("reverse_kl_clamp bounds must be finite")
+            if lower >= upper:
+                raise ValueError("reverse_kl_clamp lower bound must be smaller than upper bound")
         return self
 
     def resolve_teacher_endpoints(
@@ -95,6 +103,106 @@ def validate_opd_sample_params(sample_params: SampleParams) -> None:
         raise ValueError(f"PG-OPD requires identity student sampling, got {non_identity_params}")
     if not sample_params.return_logprob or not sample_params.return_token_ids:
         raise ValueError("PG-OPD requires return_logprob=True and return_token_ids=True")
+
+
+@torch.no_grad()
+def compute_reverse_kl_distribution_metrics(
+    reverse_kl_values: torch.Tensor,
+    *,
+    histogram_bins: int = 8192,
+) -> dict[str, torch.Tensor]:
+    """Compute global raw token-level reverse-KL distribution metrics.
+
+    Moments and extrema are exact. Quantiles are estimated from a global,
+    communication-efficient histogram so token values do not need to be
+    gathered across ranks.
+
+    Args:
+        reverse_kl_values (torch.Tensor): Local rank's valid-token reverse-KL values.
+        histogram_bins (int): Number of bins used to estimate global quantiles.
+
+    Returns:
+        dict[str, torch.Tensor]: Global reverse-KL distribution metrics.
+    """
+    if histogram_bins <= 0:
+        raise ValueError("histogram_bins must be positive")
+
+    values = reverse_kl_values.detach().float().reshape(-1)
+    device = values.device
+    local_moments = torch.stack(
+        (
+            torch.tensor(float(values.numel()), device=device),
+            values.sum(),
+            values.abs().sum(),
+            values.square().sum(),
+        )
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(local_moments, op=dist.ReduceOp.SUM)
+
+    global_count, global_sum, global_abs_sum, global_square_sum = local_moments
+    if global_count.item() == 0:
+        zero = values.new_zeros(())
+        return {
+            "reverse_kl": zero,
+            "abs_logprob_loss": zero,
+            "reverse_kl_variance": zero,
+            "reverse_kl_p1": zero,
+            "reverse_kl_p99": zero,
+            "reverse_kl_p999": zero,
+            "reverse_kl_max_abs": zero,
+        }
+
+    if values.numel() > 0:
+        local_extrema = torch.stack((-values.min(), values.max(), values.abs().max()))
+    else:
+        local_extrema = torch.full((3,), -torch.inf, device=device)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(local_extrema, op=dist.ReduceOp.MAX)
+    global_min = -local_extrema[0]
+    global_max = local_extrema[1]
+    global_max_abs = local_extrema[2]
+
+    mean = global_sum / global_count
+    variance = torch.clamp(global_square_sum / global_count - mean.square(), min=0.0)
+
+    if global_min == global_max:
+        quantiles = (global_min, global_min, global_min)
+    else:
+        histogram = torch.histc(
+            values,
+            bins=histogram_bins,
+            min=global_min.item(),
+            max=global_max.item(),
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(histogram, op=dist.ReduceOp.SUM)
+        cumulative = histogram.cumsum(dim=0)
+        bin_width = (global_max - global_min) / histogram_bins
+        quantiles_list = []
+        for q in (0.01, 0.99, 0.999):
+            zero_based_rank = q * (global_count - 1.0)
+            bin_idx = torch.searchsorted(cumulative, zero_based_rank + 1.0).clamp(
+                max=histogram_bins - 1
+            )
+            count_before = cumulative[bin_idx - 1] if bin_idx.item() > 0 else cumulative.new_zeros(())
+            count_in_bin = histogram[bin_idx].clamp_min(1.0)
+            fraction_in_bin = ((zero_based_rank - count_before) / count_in_bin).clamp(0.0, 1.0)
+            quantile = global_min + (bin_idx + fraction_in_bin) * bin_width
+            quantiles_list.append(
+                torch.clamp(quantile, min=global_min, max=global_max)
+            )
+        quantiles = tuple(quantiles_list)
+
+    return {
+        "reverse_kl": mean,
+        "abs_logprob_loss": global_abs_sum / global_count,
+        "reverse_kl_variance": variance,
+        "reverse_kl_p1": quantiles[0],
+        "reverse_kl_p99": quantiles[1],
+        "reverse_kl_p999": quantiles[2],
+        "reverse_kl_max_abs": global_max_abs,
+    }
 
 
 class TeacherLogprobClient:
@@ -302,9 +410,13 @@ def apply_opd_kl_to_advantages(
     reverse_kl = old_logprobs - teacher_logprobs
     reverse_kl_sum = (reverse_kl * response_mask).sum().detach()
     abs_logprob_loss_sum = (reverse_kl.abs() * response_mask).sum().detach()
+    reverse_kl_for_advantage = reverse_kl
+    if config.reverse_kl_clamp is not None:
+        lower, upper = config.reverse_kl_clamp
+        reverse_kl_for_advantage = reverse_kl.clamp(min=lower, max=upper)
     loss_kwargs.advantages = torch.where(
         response_mask,
-        loss_kwargs.advantages - config.opd_adv_weight * reverse_kl,
+        loss_kwargs.advantages - config.opd_adv_weight * reverse_kl_for_advantage,
         loss_kwargs.advantages,
     )
     loss_kwargs.teacher_logprobs = None
