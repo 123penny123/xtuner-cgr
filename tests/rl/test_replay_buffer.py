@@ -6,7 +6,7 @@
 #    不应改变 buffer 状态，也不应报错。
 # 3. 写入生成结果时会补齐训练版本信息：put(..., model_step, current_train_step)
 #    会补齐 response_model_steps，并刷新 seq_staleness。
-# 4. tail batch disabled 时将 EXPIRED 当作终态并 discard 整个状态；enabled 时保留
+# 4. tail batch disabled 时将 EXPIRED 当作终态，释放重字段且不写入 buffer；enabled 时保留
 #    prompt/mm_info，只重置 response 和 routed experts 以便重新 rollout。
 # 5. refresh_staleness 的公共契约：可以刷新 completed/aborted 记录，也要尊重显式传入的
 #    status 过滤条件。
@@ -179,8 +179,8 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 assert completed[0][0].response_model_steps == [3, 3]
                 assert completed[0][0].seq_staleness == 1
 
-    async def test_common_put_discards_expired_group_when_tail_batch_is_disabled(self):
-        # tail batch disabled 时 EXPIRED 是终态，释放 prompt 和 multimodal 重字段。
+    async def test_common_put_drops_expired_group_when_tail_batch_is_disabled(self):
+        # tail batch disabled 时 EXPIRED 是终态，释放重字段后不再写入 replay buffer。
         for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
             with self.subTest(replay_buffer_config=config_name):
                 replay_buffer = replay_buffer_config_cls().build()
@@ -206,20 +206,21 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                     stale_threshold=3,
                 )
 
-                expired = await replay_buffer.get(1, "task", Status.EXPIRED)
-                discarded = expired[0][0]
-                assert discarded.status == Status.EXPIRED
-                assert discarded.prompt_ids is None
-                assert discarded.tokens is None
-                assert discarded.mm_info is None
-                assert discarded.extra_fields == {}
+                assert stale.status == Status.EXPIRED
+                assert stale.prompt_ids is None
+                assert stale.tokens is None
+                assert stale.mm_info is None
+                assert stale.extra_fields == {}
+                assert await replay_buffer.count("task", Status.EXPIRED) == 0
+                assert len(replay_buffer) == 0
+                assert await replay_buffer.get(1, "task", Status.EXPIRED) == []
 
-    async def test_common_put_keeps_rerollout_inputs_when_tail_batch_trigger_size_is_positive(self):
-        # tail batch 会重新采样 EXPIRED，只清理旧输出和 routed experts，保留 pixel_values。
+    async def test_common_put_keeps_rerollout_inputs_before_tail_batch_is_ready(self):
+        # tail batch 尚未攒够时也要保留 EXPIRED，只清理旧输出和 routed experts，保留 pixel_values。
         for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
             with self.subTest(replay_buffer_config=config_name):
                 replay_buffer = replay_buffer_config_cls().build()
-                replay_buffer.bind_tail_batch_trigger_sizes({"task": 1})
+                replay_buffer.bind_tail_batch_trigger_sizes({"task": 2})
                 pixel_values = np.ones((2, 3), dtype=np.float32)
                 stale = make_rollout_state(
                     1,
@@ -262,33 +263,43 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 assert reusable.mm_info["pixel_values"] is pixel_values
                 assert reusable.extra_fields == {"train_prompt_ids": [101, 102]}
 
-    async def test_common_refresh_staleness_discards_expired_group_when_tail_batch_is_disabled(self):
-        # refresh_staleness 翻转出的 EXPIRED 同样遵循 tail batch disabled 的 discard 行为。
+    async def test_common_refresh_staleness_drops_only_terminal_expired_groups(self):
+        # 同一轮 refresh 仍统计两类过期；只删除 terminal EXPIRED，保留 tail batch 可重试项。
         for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
             with self.subTest(replay_buffer_config=config_name):
                 replay_buffer = replay_buffer_config_cls().build()
-                replay_buffer.bind_tail_batch_trigger_sizes({"task": 0})
-                await replay_buffer.put(
-                    [
-                        make_rollout_state(
-                            1,
-                            response_model_steps=[1],
-                            mm_info={"pixel_values": np.ones((2, 3), dtype=np.float32)},
-                        )
-                    ],
-                    "task",
+                replay_buffer.bind_tail_batch_trigger_sizes({"terminal_task": 0, "retryable_task": 2})
+                terminal_stale = make_rollout_state(
+                    1,
+                    response_model_steps=[1],
+                    mm_info={"pixel_values": np.ones((2, 3), dtype=np.float32)},
                 )
+                retryable_stale = make_rollout_state(
+                    2,
+                    response_model_steps=[1],
+                    mm_info={"pixel_values": np.ones((2, 3), dtype=np.float32)},
+                )
+                await replay_buffer.put([terminal_stale], "terminal_task")
+                await replay_buffer.put([retryable_stale], "retryable_task")
+                assert len(replay_buffer) == 2
 
-                await replay_buffer.refresh_staleness(
-                    task_stale_thresholds={"task": 2},
+                expired_counts = await replay_buffer.refresh_staleness(
+                    task_stale_thresholds={"terminal_task": 2, "retryable_task": 2},
                     current_train_step=4,
                 )
 
-                expired = await replay_buffer.get(1, "task", Status.EXPIRED)
-                discarded = expired[0][0]
-                assert discarded.status == Status.EXPIRED
-                assert discarded.prompt_ids is None
-                assert discarded.mm_info is None
+                assert expired_counts == {"terminal_task": 1, "retryable_task": 1}
+                assert terminal_stale.status == Status.EXPIRED
+                assert terminal_stale.prompt_ids is None
+                assert terminal_stale.mm_info is None
+                assert retryable_stale.status == Status.EXPIRED
+                assert retryable_stale.prompt_ids == [2, 1002]
+                assert retryable_stale.mm_info is not None
+                assert await replay_buffer.count("terminal_task", Status.COMPLETED) == 0
+                assert await replay_buffer.count("terminal_task", Status.EXPIRED) == 0
+                assert await replay_buffer.count("retryable_task", Status.EXPIRED) == 1
+                assert len(replay_buffer) == 1
+                assert await replay_buffer.get(1, "terminal_task", Status.EXPIRED) == []
 
     async def test_common_refresh_staleness_contract(self):
         # refresh_staleness 同时覆盖默认刷新 completed/aborted，以及 status filter 只刷新指定状态。
