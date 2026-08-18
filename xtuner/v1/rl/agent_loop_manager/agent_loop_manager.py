@@ -178,6 +178,7 @@ class AgentLoopManagerConfig(BaseModel):
             replay_buffer=replay_buffer,
             rollout_controller=rollout_controller,
             logger=logger,
+            opd_enabled=opd_config is not None,
         )
 
 
@@ -192,6 +193,7 @@ class AgentLoopManager:
     name: str
     logger: Any
     task_names: list[str]
+    opd_enabled: bool
 
     def __init__(
         self,
@@ -199,6 +201,7 @@ class AgentLoopManager:
         replay_buffer: ReplayBuffer,
         rollout_controller: RolloutController,
         logger=None,
+        opd_enabled: bool = False,
     ):
         if not task_runners:
             raise ValueError("AgentLoopManager requires at least one task runner.")
@@ -216,6 +219,7 @@ class AgentLoopManager:
         self.name = task_runners[0].task_name if len(task_runners) == 1 else "multi_task"
         self.logger = get_logger() if logger is None else logger
         self.task_names = [task.task_name for task in task_runners]
+        self.opd_enabled = opd_enabled
 
     async def produce_batch(
         self,
@@ -240,6 +244,13 @@ class AgentLoopManager:
             task_names=self.task_names,
             target_samples=current_sizes,
         )
+        opd_task_model_steps = {
+            task.task_name: model_step
+            for task in active_tasks
+            if self.opd_enabled and task.mask_offpolicy_in_partial_rollout
+        }
+        if opd_task_model_steps:
+            await self.replay_buffer.refresh_onpolicy_completed_masks(task_model_steps=opd_task_model_steps)
         # 生产前刷新已有 completed / aborted 的 staleness。
         await refresh_for_all_tasks(
             task_runners=self.task_runners,

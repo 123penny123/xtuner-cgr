@@ -115,6 +115,7 @@ class _FakeReplayBuffer:
         self._rollout_states_by_task = rollout_states_by_task
         self._leftover_counts = leftover_counts
         self.refresh_staleness_calls: list[tuple[str, int, int, tuple[Status, ...]]] = []
+        self.refresh_onpolicy_completed_masks_calls: list[dict[str, int]] = []
 
     async def get(self, batch_size: int, task_name: str, group_status: Status):
         assert group_status == Status.COMPLETED
@@ -140,6 +141,9 @@ class _FakeReplayBuffer:
             )
             expired_counts[task_name] = 0
         return expired_counts
+
+    async def refresh_onpolicy_completed_masks(self, *, task_model_steps: dict[str, int]) -> None:
+        self.refresh_onpolicy_completed_masks_calls.append(task_model_steps)
 
     async def is_ready(self, task_batch_sizes: dict[str, int], *, group_status: Status = Status.COMPLETED):
         for task_name, batch_size in task_batch_sizes.items():
@@ -257,6 +261,32 @@ class TestMultiTaskAgentLoopManager(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_a", result.task_results)
         self.assertIn("task_b", result.task_results)
         self.assertIn("task_c", result.task_results)
+
+    async def test_colocate_opd_refreshes_completed_masks_before_production(self):
+        # OPD + partial off-policy mask 会在 completed 数量参与生产决策前刷新旧版本 group。
+        strategy = _FakeProduceStrategy()
+        strategy.mask_offpolicy_in_partial_rollout = True
+        replay_buffer = _FakeReplayBuffer(
+            rollout_states_by_task={"task": [["current-group"]]},
+            leftover_counts={},
+        )
+        manager = AgentLoopManager(
+            task_runners=[
+                _TaskRunner(
+                    task_name="task",
+                    agent_loop=_fake_agent_loop(),
+                    produce_strategy=strategy,
+                    sampler=_FakeSampler(),
+                )
+            ],
+            replay_buffer=replay_buffer,
+            rollout_controller=_fake_rollout_controller(),
+            opd_enabled=True,
+        )
+
+        await manager.produce_batch(batch_size=1, train_step=3, model_step=2)
+
+        self.assertEqual(replay_buffer.refresh_onpolicy_completed_masks_calls, [{"task": 2}])
 
     async def test_disagg_get_batch_aggregates_multi_task_results_without_colocate_surface(self):
         # 非共卡 get_batch 使用后台 progress 消费 replay buffer，不依赖共卡 produce_batch 继承面。

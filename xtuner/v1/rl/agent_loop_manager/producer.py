@@ -231,6 +231,7 @@ class AsyncProduceStrategyConfig(ProduceStrategyConfig):
         return AsyncProduceStrategy(
             over_sample_threshold=self.over_sample_threshold,
             enable_partial_rollout=self.enable_partial_rollout,
+            mask_offpolicy_in_partial_rollout=self.mask_offpolicy_in_partial_rollout,
             max_staleness=self.max_staleness,
             sync_weights_interval=sync_weights_interval,
             tail_batch_trigger_size=self.tail_batch_trigger_size,
@@ -307,6 +308,7 @@ class AsyncProduceStrategy(ProduceStrategy):
         self,
         over_sample_threshold: float,
         enable_partial_rollout: bool,
+        mask_offpolicy_in_partial_rollout: bool,
         tail_batch_trigger_size: int,
         max_staleness: int,
         sync_weights_interval: int,
@@ -328,6 +330,7 @@ class AsyncProduceStrategy(ProduceStrategy):
 
         self.over_sample_threshold = over_sample_threshold
         self.enable_partial_rollout = enable_partial_rollout
+        self.mask_offpolicy_in_partial_rollout = mask_offpolicy_in_partial_rollout
         self.max_staleness = max_staleness
         self.sync_weights_interval = sync_weights_interval
         self.stale_threshold = calculate_stale_threshold(max_staleness, sync_weights_interval)

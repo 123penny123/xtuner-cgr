@@ -267,6 +267,10 @@ class _TaskRunner:
     def stale_threshold(self) -> int | None:
         return getattr(self.produce_strategy, "stale_threshold", None)
 
+    @property
+    def mask_offpolicy_in_partial_rollout(self) -> bool:
+        return bool(getattr(self.produce_strategy, "mask_offpolicy_in_partial_rollout", False))
+
 
 class _TaskSamplerView:
     def __init__(self, samplers: list[Sampler]):

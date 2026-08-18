@@ -346,6 +346,66 @@ class TestReplayBuffer(unittest.IsolatedAsyncioTestCase):
                 assert completed[0][0].rollout_id == 3
                 assert expired[0][0].rollout_id == 4
 
+    async def test_refresh_onpolicy_completed_masks_current_suffix_and_discards_invalid_group(self):
+        # OPD on-policy 刷新保留当前模型 suffix；任一 completion 没有当前 token 时整组丢弃。
+        for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
+            with self.subTest(replay_buffer_config=config_name):
+                replay_buffer = replay_buffer_config_cls().build()
+                current_suffix = make_rollout_state(
+                    1,
+                    response_ids=[11, 12],
+                    response_model_steps=[1, 2],
+                )
+                mixed_group = [
+                    make_rollout_state(2, response_model_steps=[2]),
+                    make_rollout_state(3, response_model_steps=[1]),
+                ]
+                await replay_buffer.put([current_suffix], "task")
+                await replay_buffer.put(mixed_group, "task")
+
+                await replay_buffer.refresh_onpolicy_completed_masks(task_model_steps={"task": 2})
+
+                assert await replay_buffer.count("task", Status.COMPLETED) == 1
+                assert await replay_buffer.count("task", Status.EXPIRED) == 0
+                completed = await replay_buffer.get(1, "task", Status.COMPLETED)
+                assert completed[0][0].response_mask == [0, 1]
+                assert all(sample.response_ids is None for sample in mixed_group)
+
+    async def test_refresh_onpolicy_completed_masks_rerolls_only_stale_completed_member_in_aborted_group(self):
+        # 混合 ABORTED group 只重采旧版本的 completed 成员，未完成成员保留长前缀续采。
+        for config_name, replay_buffer_config_cls in REPLAY_BUFFER_CONFIGS:
+            with self.subTest(replay_buffer_config=config_name):
+                replay_buffer = replay_buffer_config_cls().build()
+                stale_completed = make_rollout_state(
+                    1,
+                    status=Status.COMPLETED,
+                    response_ids=[11, 12],
+                    response_model_steps=[1, 1],
+                    routed_experts=np.ones((2, 1), dtype=np.int32),
+                )
+                unfinished = make_rollout_state(
+                    2,
+                    status=Status.ABORTED,
+                    response_ids=[21, 22],
+                    response_model_steps=[1, 1],
+                )
+                await replay_buffer.put([stale_completed, unfinished], "task")
+
+                await replay_buffer.refresh_onpolicy_completed_masks(task_model_steps={"task": 2})
+
+                assert await replay_buffer.count("task", Status.ABORTED) == 1
+                aborted = await replay_buffer.get(1, "task", Status.ABORTED)
+                rerolled, preserved = aborted[0]
+                assert rerolled.status == Status.ABORTED
+                assert rerolled.response_ids == []
+                assert rerolled.response_model_steps == []
+                assert rerolled.response_mask == []
+                assert rerolled.routed_experts is None
+                assert preserved.status == Status.ABORTED
+                assert preserved.response_ids == [21, 22]
+                assert preserved.response_model_steps == [1, 1]
+                assert preserved.response_mask == [1, 1]
+
     async def test_sync_get_returns_fifo_order(self):
         # Sync replay 用于共卡按需生产，策略契约是同 task/status 下严格按入库顺序消费。
         replay_buffer = SyncReplayBufferConfig().build()
