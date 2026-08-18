@@ -1131,6 +1131,30 @@ class BaseRLTrainer:
 
                     input_ids = raw_input_ids[:-1]
                     shifted_labels = labels[1:]
+                    teacher_logprobs = None
+                    teacher_response_start = 0
+                    teacher_response_length = len(shifted_labels)
+                    if opd_config is not None:
+                        raw_teacher_logprobs = group[i].teacher_logprobs
+                        if raw_teacher_logprobs is None:
+                            raise ValueError(f"Teacher logprobs cannot be None when OPD is enabled: {group[i]}")
+                        teacher_response_start = next(
+                            (index for index, label in enumerate(shifted_labels) if label != -100),
+                            len(shifted_labels),
+                        )
+                        teacher_response_length = len(shifted_labels) - teacher_response_start
+                        if len(raw_teacher_logprobs) != teacher_response_length:
+                            raise ValueError(
+                                "Teacher logprobs must align with the trainable suffix of shifted agent labels: "
+                                f"{len(raw_teacher_logprobs)} vs {teacher_response_length}, data: {group[i]}"
+                            )
+                        # The teacher omits the cacheable masked prefix. Pad it
+                        # back to the shifted sequence shape; labels=-100 keeps
+                        # these placeholder values out of OPD metrics and loss.
+                        teacher_logprobs = torch.tensor(
+                            [0.0] * teacher_response_start + raw_teacher_logprobs,
+                            dtype=torch.float32,
+                        ).unsqueeze(0)
                     prompt_len = sum(label == -100 for label in shifted_labels)
                     response_len = len(shifted_labels) - prompt_len
                     prompt_len_list.append(prompt_len)
@@ -1160,7 +1184,17 @@ class BaseRLTrainer:
                         "shifted_labels": shifted_labels_t,
                         "advantage": actual_advantages,
                         "rollout_logprobs": rollout_logprobs,
-                        "opd_trajectory_info": None,
+                        "teacher_logprobs": teacher_logprobs,
+                        "opd_trajectory_info": (
+                            {
+                                "rollout_id": group[i].rollout_id,
+                                "group_id": group[i].group_id,
+                                "response_start": teacher_response_start,
+                                "response_length": teacher_response_length,
+                            }
+                            if opd_config is not None
+                            else None
+                        ),
                     }
 
                     seq_ctx.rollout_routed_experts = group[i].routed_experts
