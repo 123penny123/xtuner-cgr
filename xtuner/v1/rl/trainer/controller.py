@@ -23,6 +23,7 @@ class ColateItem(TypedDict):
     advantage: float
     rollout_logprobs: torch.Tensor | None
     teacher_logprobs: torch.Tensor | None
+    opd_trajectory_info: dict | None
 
 
 class TrainingController:
@@ -94,6 +95,15 @@ class TrainingController:
             seq_ctx_list = [data_batches[i]["seq_ctx"] for i in indices]
             label_list = [data_batches[i]["shifted_labels"] for i in indices]
             advantage_list = [data_batches[i]["advantage"] for i in indices]
+            opd_trajectory_infos = []
+            packed_offset = 0
+            for i in indices:
+                trajectory_info = data_batches[i].get("opd_trajectory_info")
+                if trajectory_info is not None:
+                    trajectory_info = dict(trajectory_info)
+                    trajectory_info["response_start"] += packed_offset
+                    opd_trajectory_infos.append(trajectory_info)
+                packed_offset += data_batches[i]["shifted_labels"].numel()
 
             rollout_logprobs_list = None
             if "rollout_logprobs" in data_batches[0] and data_batches[0]["rollout_logprobs"] is not None:
@@ -173,6 +183,7 @@ class TrainingController:
                     "advantages": advantages,
                     "rollout_logprobs": rollout_logprobs,
                     "teacher_logprobs": teacher_logprobs,
+                    "opd_trajectory_infos": opd_trajectory_infos,
                 }
             )
         return packed_data_batches
@@ -266,6 +277,7 @@ class TrainingController:
                 "advantages": pad_advantages,
                 "rollout_logprobs": pad_rollout_logprobs,
                 "teacher_logprobs": pad_teacher_logprobs,
+                "opd_trajectory_infos": [],
             }
             pad_data_samples = [pad_data for _ in range(pad_num)]
             packed_data_batches = packed_data_batches + pad_data_samples

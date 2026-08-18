@@ -70,6 +70,56 @@ DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
 
 
+def build_token_opd_kl_shard(
+    reverse_kl_list: Sequence[torch.Tensor],
+    shifted_labels_list: Sequence[torch.Tensor],
+    trajectory_infos_list: Sequence[list[dict]],
+) -> dict:
+    """Build an FP16 response-token OPD-KL shard on CPU.
+
+    Values are raw, unclamped ``old_logprobs - teacher_logprobs``. Tokens
+    excluded from policy loss are stored as NaN, so no separate mask is needed.
+    """
+    chunks: list[torch.Tensor] = []
+    records: list[dict] = []
+    shard_offset = 0
+    for reverse_kl, shifted_labels, trajectory_infos in zip(
+        reverse_kl_list, shifted_labels_list, trajectory_infos_list
+    ):
+        reverse_kl = reverse_kl.detach().float().reshape(-1)
+        shifted_labels = shifted_labels.detach().reshape(-1)
+        for trajectory_info in trajectory_infos:
+            response_start = int(trajectory_info["response_start"])
+            response_length = int(trajectory_info["response_length"])
+            response_end = response_start + response_length
+            if response_start < 0 or response_end > reverse_kl.numel():
+                raise ValueError(
+                    f"Invalid response token range [{response_start}, {response_end}) "
+                    f"for packed sequence length {reverse_kl.numel()}"
+                )
+            values = reverse_kl[response_start:response_end].clone()
+            valid_mask = shifted_labels[response_start:response_end] != -100
+            values[~valid_mask] = torch.nan
+            values = values.to(device="cpu", dtype=torch.float16)
+            chunks.append(values)
+            records.append(
+                {
+                    "rollout_id": str(trajectory_info["rollout_id"]),
+                    "group_id": str(trajectory_info["group_id"]),
+                    "offset": shard_offset,
+                    "length": response_length,
+                    "valid_tokens": int(valid_mask.sum().item()),
+                }
+            )
+            shard_offset += response_length
+    return {
+        "format_version": 1,
+        "definition": "old_logprobs_minus_teacher_logprobs_unclamped",
+        "opd_kl": torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.float16),
+        "trajectories": records,
+    }
+
+
 def calculate_entropy(
     shifted_labels_list: Sequence[torch.Tensor],
     old_logprobs_list: Sequence[torch.Tensor | None],
@@ -191,6 +241,7 @@ class WorkerInputItem(TypedDict):
     advantages: torch.Tensor
     rollout_logprobs: torch.Tensor | None
     teacher_logprobs: torch.Tensor | None
+    opd_trajectory_infos: list[dict]
 
 
 class WorkerTrainLogItem(TypedDict, total=False):
@@ -215,6 +266,7 @@ class WorkerLogItem(TypedDict):
     rollout_is_metrics: NotRequired[dict[str, float]]
     train_metrics: List[WorkerTrainLogItem]
     sft_train_metrics: NotRequired[dict[str, float]]
+    token_opd_kl_shard: NotRequired[str]
 
 
 class TrainingWorker(SingleAcceleratorWorker):
@@ -564,6 +616,7 @@ class TrainingWorker(SingleAcceleratorWorker):
         seq_ctx_list: list[SequenceContext] = []
         loss_ctx_list: list[BaseRLLossContext] = []
         mtp_loss_ctx_list: list[list[MTPLossContext]] = []
+        trajectory_infos_list: list[list[dict]] = []
         prepare_inputs_begin = time.perf_counter()
         for data in data_batches:
             # update seq_ctx
@@ -608,6 +661,7 @@ class TrainingWorker(SingleAcceleratorWorker):
             seq_ctx_list.append(seq_ctx)
             assert loss_ctx is not None
             loss_ctx_list.append(loss_ctx)
+            trajectory_infos_list.append(data.get("opd_trajectory_infos", []))
             if self.mtp_config is not None:
                 mtp_loss_ctxs_per_batch: list[MTPLossContext] = []
                 for mtp_idx in range(self.mtp_config.num_layers):
@@ -641,17 +695,62 @@ class TrainingWorker(SingleAcceleratorWorker):
         # compute old logprobs
         old_logprobs_list = self.compute_actor_logprobs(seq_ctx_list, shifted_labels_list)
         rank_reverse_kl_values: list[torch.Tensor] = []
-        for old_logprobs, loss_ctx in zip(old_logprobs_list, loss_ctx_list):
+        save_token_opd_kl = (
+            self.config.opd_config is not None and os.environ.get("SAVE_TOKEN_OPD_KL", "1") == "1"
+        )
+        data_replicate_size = self._engine.data_replicate_size * self.sp_mesh.size()
+        write_token_opd_kl = save_token_opd_kl and self.rank % data_replicate_size == 0
+        if save_token_opd_kl and self.sp_mesh.size() != 1:
+            raise NotImplementedError("Token OPD-KL sidecar currently requires sp_size=1")
+        token_opd_kl_parts: list[dict] = []
+        for old_logprobs, loss_ctx, trajectory_infos in zip(
+            old_logprobs_list, loss_ctx_list, trajectory_infos_list
+        ):
             loss_ctx.loss_kwargs.old_logprobs = old_logprobs
             if self.config.opd_config is not None:
                 teacher_logprobs = cast(torch.Tensor, loss_ctx.loss_kwargs.teacher_logprobs)
                 response_mask = loss_ctx.loss_kwargs.shifted_labels != loss_ctx.loss_cfg.ignore_idx
+                raw_reverse_kl = old_logprobs - teacher_logprobs
                 rank_reverse_kl_values.append(
-                    (old_logprobs - teacher_logprobs)[response_mask].detach()
+                    raw_reverse_kl[response_mask].detach()
                 )
+                if write_token_opd_kl:
+                    token_opd_kl_parts.append(
+                        build_token_opd_kl_shard(
+                            [raw_reverse_kl],
+                            [loss_ctx.loss_kwargs.shifted_labels],
+                            [trajectory_infos],
+                        )
+                    )
                 apply_opd_kl_to_advantages(loss_ctx, config=self.config.opd_config)
 
         worker_log_item: WorkerLogItem = {"train_entropy": 0.0, "train_metrics": [], "sft_train_metrics": {}}
+        if write_token_opd_kl:
+            shard_values = []
+            shard_records = []
+            shard_offset = 0
+            for part in token_opd_kl_parts:
+                shard_values.append(part["opd_kl"])
+                for record in part["trajectories"]:
+                    record = dict(record)
+                    record["offset"] += shard_offset
+                    shard_records.append(record)
+                shard_offset += part["opd_kl"].numel()
+            shard = {
+                "format_version": 1,
+                "definition": "old_logprobs_minus_teacher_logprobs_unclamped",
+                "opd_kl": torch.cat(shard_values) if shard_values else torch.empty(0, dtype=torch.float16),
+                "trajectories": shard_records,
+            }
+            output_root = self.log_dir.parent if self.log_dir is not None else Path(os.environ["WORK_DIR"])
+            output_dir = output_root / "train_rollout" / "token_opd_kl"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            shard_path = output_dir / f"train_rollout_{rollout_idx}_rank{self.rank}.pt"
+            torch.save(shard, shard_path)
+            worker_log_item["token_opd_kl_shard"] = str(shard_path)
+            self.logger.info(
+                f"Saved {len(shard['trajectories'])} token OPD-KL records to {shard_path}"
+            )
         logger_msg = f"Rollout {rollout_idx}: "
 
         # compute entropy

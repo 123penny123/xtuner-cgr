@@ -1160,6 +1160,7 @@ class BaseRLTrainer:
                         "shifted_labels": shifted_labels_t,
                         "advantage": actual_advantages,
                         "rollout_logprobs": rollout_logprobs,
+                        "opd_trajectory_info": None,
                     }
 
                     seq_ctx.rollout_routed_experts = group[i].routed_experts
@@ -1239,11 +1240,19 @@ class BaseRLTrainer:
                     "rollout_logprobs": rollout_logprobs,
                 }
                 if opd_config is not None:
+                    data_dict["opd_trajectory_info"] = {
+                        "rollout_id": group[i].rollout_id,
+                        "group_id": group[i].group_id,
+                        "response_start": len(prompt_ids) - 1,
+                        "response_length": len(response_ids),
+                    }
                     response_teacher_logprobs = cast(list[float], group[i].teacher_logprobs)
                     data_dict["teacher_logprobs"] = torch.tensor(
                         [0.0] * (len(prompt_ids) - 1) + response_teacher_logprobs,
                         dtype=torch.float32,
                     ).unsqueeze(0)
+                else:
+                    data_dict["opd_trajectory_info"] = None
 
                 seq_ctx.rollout_routed_experts = group[i].routed_experts  # n,layer*expert
 
